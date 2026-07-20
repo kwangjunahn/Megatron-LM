@@ -89,7 +89,7 @@ class _GranularityConfig(NamedTuple):
 
         Args:
             request: Grouped rollout request to check.
-            num_groups_per_env: Proposed per-env group layout.
+            num_groups_per_env: Constant per-env group layout.
         """
         assert (
             GRANULARITY_RANK[request.consumption_granularity]
@@ -106,8 +106,7 @@ class _GranularityConfig(NamedTuple):
         ), "The sum of groups per environment must equal the total number of groups requested."
         assert not request.filter_groups_with_same_reward, (
             "filter_groups_with_same_reward is not currently supported: dropped groups "
-            "are not regenerated, so non-streaming callers receive fewer groups than "
-            "requested and batch-order consumers stall on incomplete batches."
+            "are not regenerated, so batch-order consumers stall on incomplete batches."
         )
 
 
@@ -236,10 +235,6 @@ class RolloutPipeline:
         self.num_infer_workers = self.gate.capacity * (
             rollouts_per_batch // self.gran_policy.units_per_batch()
         )
-        if not request.streaming:
-            self.num_infer_workers = min(
-                self.num_infer_workers, request.num_groups * request.rollouts_per_group
-            )
 
         # Core queues.
         self.infer_queue = asyncio_Queue()
@@ -290,53 +285,71 @@ class RolloutPipeline:
                 ),
                 None,
             )
-            expected_end = (
-                not self.request.streaming
-                and self.yielded_count == self.request.num_groups
-            )
-            if failure is not None or not expected_end:
-                raise RuntimeError(
-                    "RolloutPipeline output stream ended: a pipeline stage died"
-                    + ("" if failure is not None else " (no stage exception was recovered)")
-                ) from failure
+            raise RuntimeError(
+                "RolloutPipeline output stream ended: a pipeline stage died"
+                + ("" if failure is not None else " (no stage exception was recovered)")
+            ) from failure
         finally:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def assert_no_inflight_rollouts(self) -> None:
+        """Verify no rollouts are buffered or in-flight at an iteration boundary for lag=0."""
+        buffered = {
+            "infer_queue": self.infer_queue.qsize(),
+            "assemble_queue": self.assemble_queue.qsize(),
+            "output_queue": self.output_queue.qsize(),
+            "assemble_pending": sum(len(items) for items in self._assemble_pending.values()),
+            "consume_pending": sum(len(groups) for groups in self._consume_pending.values()),
+        }
+        assert not any(buffered.values()), (
+            f"The rollout pipeline has buffered rollouts at iteration boundary: {buffered}. "
+            "The generator has run ahead under a stale policy."
+        )
+        in_flight = (
+            self.prepared_count - self.yielded_count * self.request.rollouts_per_group
+        )
+        assert in_flight == 0, (
+            f"The rollout pipeline prepared {self.prepared_count} rollout(s) but yielded "
+            f"{self.yielded_count} group(s) of {self.request.rollouts_per_group}; "
+            f"{in_flight} rollout(s) in flight at iteration boundary."
+        )
+
     async def stage_prepare(self) -> None:
         """Generate gated inference work items."""
-        assert (
-            self.request.streaming
-            or self.request.num_groups % self.gran_policy.num_groups_per_batch == 0
-        ), "non-streaming requires num_groups to be a multiple of num_groups_per_batch"
         group_id = 0
+        batch_id = 0
         try:
-            while self.request.streaming or group_id < self.request.num_groups:
+            while True:
                 await self.gate.acquire_for("B")
-                batch_id = group_id // self.gran_policy.num_groups_per_batch
 
-                for index_in_batch in range(self.gran_policy.num_groups_per_batch):
-                    env_index = self.gran_policy.env_of_index(index_in_batch)
-                    await self.gate.acquire_for("G")
-                    agent = self.allocations[env_index].agent
-                    params: GroupRolloutParams = await agent.prepare_group_rollout(self.request)
-                    self.prepared_groups_per_env[env_index] += 1
-
-                    for rollout_idx in range(self.request.rollouts_per_group):
-                        await self.gate.acquire_for("R")
-                        item = _InferWorkItem(
-                            group_id=group_id,
-                            rollout_idx=rollout_idx,
-                            batch_id=batch_id,
-                            index_in_batch=index_in_batch,
-                            params=params,
-                            env_index=env_index,
-                            prepared_at=time.monotonic(),
+                index_in_batch = 0
+                for env_index, env_groups in enumerate(self.gran_policy.num_groups_per_env):
+                    for _ in range(env_groups):
+                        await self.gate.acquire_for("G")
+                        agent = self.allocations[env_index].agent
+                        params: GroupRolloutParams = await agent.prepare_group_rollout(
+                            self.request
                         )
-                        await self.infer_queue.put(item)
-                        self.prepared_count += 1
-                    group_id += 1
+                        self.prepared_groups_per_env[env_index] += 1
+
+                        for rollout_idx in range(self.request.rollouts_per_group):
+                            await self.gate.acquire_for("R")
+                            item = _InferWorkItem(
+                                group_id=group_id,
+                                rollout_idx=rollout_idx,
+                                batch_id=batch_id,
+                                index_in_batch=index_in_batch,
+                                params=params,
+                                env_index=env_index,
+                                prepared_at=time.monotonic(),
+                            )
+                            await self.infer_queue.put(item)
+                            self.prepared_count += 1
+                        group_id += 1
+                        index_in_batch += 1
+                batch_id += 1
         finally:
             self.infer_queue.shutdown()
 
