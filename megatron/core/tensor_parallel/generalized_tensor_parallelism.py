@@ -680,6 +680,22 @@ def attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grou
 # Cache of dynamic ``GTP_<Fp8TensorClass>`` subclasses, keyed by the FP8 base class.
 _GTP_NATIVE_FP8_SUBCLASSES: Dict[type, type] = {}
 
+
+def _gtp_native_fp8_detach(self):
+    """Detach a native-FP8 GTP weight without dropping its dynamic subclass.
+
+    Some TE quantized tensors construct their concrete base class in ``detach``. PyTorch requires
+    a tensor subclass's ``detach`` result to have the exact same type when wrapping it in a
+    ``Parameter`` (for example during ``Module._apply``). Reconstruct with the dynamic GTP class
+    and copy the GTP-only runtime attributes that TE's ``make_like`` does not know about.
+    """
+    detached = type(self).make_like(self)
+    for name, value in self.__dict__.items():
+        if name not in detached.__dict__:
+            setattr(detached, name, value)
+    return detached
+
+
 # GTPShardedParam members NOT copied into the dynamic ``GTP_<Fp8Class>`` subclass (and why):
 #   - __new__ / __init__: construction hooks — we only *reclass* an existing FP8 instance, never
 #     construct one; GTP attrs are set afterwards by _init_gtp_runtime_attrs.
@@ -720,6 +736,9 @@ def _gtp_native_fp8_subclass(base_cls: type) -> type:
         # Share the (class-level) prefetch chain-state dicts with GTPShardedParam.
         ns["_chain_state"] = GTPShardedParam._chain_state
         ns["_recompute_chain_state"] = GTPShardedParam._recompute_chain_state
+        # TE quantized tensor detach implementations may hardcode their base class. Preserve the
+        # exact dynamic type required when PyTorch rewraps the tensor as a Parameter.
+        ns["detach"] = _gtp_native_fp8_detach
         sub = type(f"GTP_{base_cls.__name__}", (base_cls,), ns)
         _GTP_NATIVE_FP8_SUBCLASSES[base_cls] = sub
     return sub

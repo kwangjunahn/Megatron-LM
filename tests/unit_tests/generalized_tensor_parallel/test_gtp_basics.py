@@ -817,6 +817,15 @@ def _worker_mxfp8_linear(rank, world_size, port):
     assert getattr(w, "is_gtp_weight_remat", False), "GTP surface missing on native param"
     assert w.shape[0] * world_size == out_f, "weight must be dim-0 sharded"
 
+    # PyTorch rewraps parameters this way during Module._apply (e.g. model.cuda()). TE's MXFP8
+    # detach implementation constructs a base MXFP8Tensor, so the GTP dynamic subclass must
+    # override it to satisfy Parameter's exact-type invariant and retain the GTP runtime surface.
+    detached_w = w.detach()
+    assert type(detached_w) is type(w), "detach must preserve the dynamic GTP MXFP8 type"
+    assert getattr(detached_w, "is_gtp_weight_remat", False), "detach dropped GTP runtime attrs"
+    rewrapped_w = nn.Parameter(w, requires_grad=w.requires_grad)
+    assert type(rewrapped_w) is type(w), "Parameter rewrap must preserve the GTP MXFP8 type"
+
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
