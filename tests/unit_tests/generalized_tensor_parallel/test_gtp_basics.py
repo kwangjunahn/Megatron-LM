@@ -46,6 +46,7 @@ from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 import megatron.core.tensor_parallel.gtp_cuda_graphs as gtp_cuda_graphs
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import copy_tensors_to_quantized_params
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTPChain,
@@ -807,7 +808,7 @@ def _worker_mxfp8_linear(rank, world_size, port):
     batch, in_f, out_f = 32, 64, 128  # out_f % (16*world_size)==0 → no padding
     dtype = torch.bfloat16
     gtp_remat_group = dist.new_group(list(range(world_size)))
-    recipe = MXFP8BlockScaling()
+    recipe = MXFP8BlockScaling(enable_2d_quantization=True)
     layer = _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe)
 
     # The weight IS the native FP8 shard: a QuantizedTensor with the GTP surface attached.
@@ -825,6 +826,15 @@ def _worker_mxfp8_linear(rank, world_size, port):
     assert getattr(detached_w, "is_gtp_weight_remat", False), "detach dropped GTP runtime attrs"
     rewrapped_w = nn.Parameter(w, requires_grad=w.requires_grad)
     assert type(rewrapped_w) is type(w), "Parameter rewrap must preserve the GTP MXFP8 type"
+
+    # DDP's native FP8 parameter-gather path requantizes BF16 bucket slices into the dynamic GTP
+    # MXFP8 parameter after every all-gather. TE's C++ update accepts only its exact base tensor
+    # type, so MCore must present a storage-sharing base view at that boundary.
+    gathered_w = torch.zeros(w.shape, dtype=dtype, device="cuda")
+    copy_tensors_to_quantized_params([w], [gathered_w])
+    for data in (w._rowwise_data, w._columnwise_data):
+        if data is not None:
+            assert torch.count_nonzero(data) == 0, "requantization did not update shared storage"
 
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)

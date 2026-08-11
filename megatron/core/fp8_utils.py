@@ -263,7 +263,12 @@ def copy_tensors_to_quantized_params(params: List[torch.Tensor], srcs: List[torc
     # Equivalent to dst.copy_(src), but entered directly instead of via the aten::copy_ op,
     # QuantizedTensor.__torch_dispatch__ (type and usage checks) and dst.quantize_(src).
     for src, quantizer, dst in zip(srcs_to_cast, quantizers, dsts_to_cast):
-        quantizer.update_quantized(src, dst)
+        update_dst = dst
+        if HAVE_TE_MXFP8TENSOR and isinstance(dst, MXFP8Tensor) and type(dst) is not MXFP8Tensor:
+            # TE's C++ converter checks for the exact MXFP8Tensor Python type. The base view
+            # shares storage with a dynamic GTP MXFP8 subclass, so the update remains in-place.
+            update_dst = MXFP8Tensor.make_like(dst)
+        quantizer.update_quantized(src, update_dst)
 
 
 def modify_grouped_tensor_rowwise_storage(tensor: torch.Tensor, new_storage: torch.Tensor) -> None:
