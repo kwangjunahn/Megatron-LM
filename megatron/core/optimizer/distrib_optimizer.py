@@ -3111,6 +3111,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     if self._is_distopt_quantized_param(model_param):
                         if self._is_grouped_quantized_tensor(model_param):
                             dequantized_model_param = model_param.float()
+                        elif getattr(model_param, "is_gtp_weight_remat", False):
+                            # TE dispatches dequantization on the exact quantized tensor class.
+                            # Native-FP8 GTP params use a dynamic subclass, so temporarily expose
+                            # their TE base class at this model-only checkpoint boundary.
+                            from ..tensor_parallel.gtp_api import dequantize_gtp_native_fp8
+
+                            dequantized_model_param = dequantize_gtp_native_fp8(model_param)
                         else:
                             dequantized_model_param = dequantize_fp8_tensor(model_param)
                         shard_model_param = dequantized_model_param.view(-1)[

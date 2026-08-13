@@ -17,6 +17,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.gtp_api import dequantize_gtp_native_fp8
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -545,6 +546,169 @@ class TestFP8Param:
         """
         kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
         self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
+
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_mxfp8_2d_dequantize_matches_reference(self):
+        """2D MXFP8 dequantization must apply the scale of each 32x32 block."""
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+        block_size = 32
+        fp8_max = 448.0
+
+        def float_to_e8m0(amax):
+            scale = (amax.float() / fp8_max).contiguous()
+            scale_u32 = scale.view(torch.int32)
+            exponent = ((scale_u32 >> 23) & 0xFF).to(torch.int32)
+            mantissa = scale_u32 & 0x7FFFFF
+            round_up = (
+                (mantissa > 0) & (exponent != 254) & ~((exponent == 0) & (mantissa <= 0x400000))
+            )
+            exponent = exponent + round_up.to(torch.int32)
+            return torch.where(scale == 0, torch.zeros_like(exponent), exponent).to(torch.uint8)
+
+        for shape in ((1280, 10240), (3072, 10240), (1056, 256)):
+            rows, cols = shape
+            generator = torch.Generator(device="cuda")
+            generator.manual_seed(_SEED + rows)
+            source = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
+            # Make neighboring block scales observably different.
+            source[0, 0] = 64.0
+            source[block_size, block_size] = -16.0
+
+            quantizer = MXFP8Quantizer(
+                fp8_dtype=tex.DType.kFloat8E4M3,
+                rowwise=True,
+                columnwise=True,
+                with_2d_quantization=True,
+            )
+            quantized = quantizer(source)
+
+            block_rows = rows // block_size
+            block_cols = cols // block_size
+            source_blocks = source.view(block_rows, block_size, block_cols, block_size).permute(
+                0, 2, 1, 3
+            )
+            block_amax = source_blocks.float().abs().amax(dim=(-1, -2))
+            scale_bytes = float_to_e8m0(block_amax)
+            block_scale = torch.pow(2.0, scale_bytes.float() - 127)
+            scale = block_scale.repeat_interleave(block_size, 0).repeat_interleave(block_size, 1)
+            reference_data = (source.float() / scale).to(torch.float8_e4m3fn)
+            reference = (reference_data.float() * scale).to(source.dtype)
+
+            actual = quantized.dequantize()
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            torch.testing.assert_close(
+                quantized._rowwise_data.view(torch.uint8),
+                reference_data.view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    def test_mxfp8_2d_adam_master_reload_with_gtp(self):
+        """Adam masters must support both high-precision and forced-dequant reload paths."""
+        args = self.create_test_args(
+            2,
+            "mxfp8",
+            self.seq_length,
+            self.micro_batch_size,
+            False,
+            True,
+            False,
+            mxfp8_2d_quantization=True,
+            optimizer="adam",
+            overlap_param_gather=True,
+            overlap_grad_reduce=True,
+            tensor_parallel_num_weight_shards=4,
+            global_batch_size=4,
+        )
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, gtp_remat_size=args.gtp_weight_remat_size
+        )
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model, optimizer, _ = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
+        )
+
+        assert args.gtp_weight_remat_size == 2
+        assert len(model) == 1
+        high_precision_state = {}
+        for idx, (name, param) in enumerate(model[0].named_parameters()):
+            if is_mxfp8tensor(param):
+                value = dequantize_gtp_native_fp8(param).detach().clone()
+                value.add_(
+                    torch.tensor((idx % 7 + 1) / 128, dtype=value.dtype, device=value.device)
+                )
+            else:
+                value = param.detach().clone()
+            high_precision_state[name] = value
+
+        tested_params = 0
+        for optim_instance in optimizer.chained_optimizers:
+            if not isinstance(optim_instance, DistributedOptimizer):
+                continue
+            state_map = optim_instance._build_model_param_to_state_dict_param_map(
+                high_precision_state
+            )
+            expected_high_precision = []
+            expected_dequantized = []
+            for model_group, main_group in zip(
+                optim_instance.model_float16_groups, optim_instance.shard_fp32_from_float16_groups
+            ):
+                for model_param, main_param in zip(model_group, main_group):
+                    if not is_mxfp8tensor(model_param):
+                        continue
+                    assert model_param._quantizer.with_2d_quantization
+                    assert getattr(model_param, "gtp_remat_size", 1) == 2
+                    param_range = optim_instance._get_model_param_range_map(model_param)["param"]
+                    expected_high_precision.append(
+                        (
+                            main_param,
+                            state_map[model_param]
+                            .view(-1)[param_range.start : param_range.end]
+                            .float()
+                            .clone(),
+                        )
+                    )
+                    expected_dequantized.append(
+                        (
+                            main_param,
+                            dequantize_gtp_native_fp8(model_param)
+                            .view(-1)[param_range.start : param_range.end]
+                            .float()
+                            .clone(),
+                        )
+                    )
+                    tested_params += 1
+
+            assert expected_high_precision
+            for main_param, _ in expected_high_precision:
+                main_param.data.fill_(float("nan"))
+            optim_instance.reload_model_params(state_dict=high_precision_state)
+            for main_param, expected in expected_high_precision:
+                torch.testing.assert_close(main_param, expected, rtol=0, atol=0)
+
+            for main_param, _ in expected_dequantized:
+                main_param.data.fill_(float("nan"))
+            optim_instance.reload_model_params()
+            for main_param, expected in expected_dequantized:
+                torch.testing.assert_close(main_param, expected, rtol=0, atol=0)
+
+        assert tested_params > 0
 
     @pytest.mark.skipif(
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
