@@ -11,6 +11,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.enums import ModelType
+from megatron.core.extensions.transformer_engine import get_mxfp8_block_scaling_recipe
 from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -33,6 +34,17 @@ from tests.unit_tests.test_utilities import Utils
 
 _SEED = 1234
 fp8_available, reason_for_no_fp8 = check_fp8_support()
+
+
+def _get_mxfp8_2d_availability():
+    try:
+        get_mxfp8_block_scaling_recipe(mxfp8_2d_quantization=True)
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        return False, f"MXFP8 2D quantization is not available: {exc}"
+    return True, ""
+
+
+mxfp8_2d_available, reason_for_no_mxfp8_2d = _get_mxfp8_2d_availability()
 
 cuda_graph_supported = False
 reason_for_no_cuda_graph = ""
@@ -551,6 +563,7 @@ class TestFP8Param:
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not mxfp8_2d_available, reason=reason_for_no_mxfp8_2d)
     def test_mxfp8_2d_dequantize_matches_reference(self):
         """2D MXFP8 dequantization must apply the scale of each 32x32 block."""
         import transformer_engine_torch as tex
@@ -612,6 +625,7 @@ class TestFP8Param:
         get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
     )
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not mxfp8_2d_available, reason=reason_for_no_mxfp8_2d)
     def test_mxfp8_2d_adam_master_reload_with_gtp(self):
         """Adam masters must support both high-precision and forced-dequant reload paths."""
         args = self.create_test_args(

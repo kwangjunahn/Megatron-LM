@@ -693,6 +693,8 @@ def _gtp_native_fp8_detach(self):
     for name, value in self.__dict__.items():
         if name not in detached.__dict__:
             setattr(detached, name, value)
+    if getattr(self, "quantized", None) is self:
+        detached.quantized = detached
     return detached
 
 

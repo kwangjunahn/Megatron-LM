@@ -46,6 +46,7 @@ from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 import megatron.core.tensor_parallel.gtp_cuda_graphs as gtp_cuda_graphs
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import get_mxfp8_block_scaling_recipe
 from megatron.core.fp8_utils import copy_tensors_to_quantized_params
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
@@ -793,14 +794,19 @@ def _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe):
     return layer
 
 
-def _worker_mxfp8_linear(rank, world_size, port):
+def _requires_mxfp8_2d():
+    try:
+        get_mxfp8_block_scaling_recipe(mxfp8_2d_quantization=True)
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        pytest.skip(f"MXFP8 2D quantization is not available: {exc}")
+
+
+def _worker_mxfp8_linear(rank, world_size, port, mxfp8_2d_quantization):
     """Verify GTP Linear with a native MXFP8 param: all-gather + GEMM + backward.
 
     mxfp8 always implies --fp8-param-gather: the weight is built as a native FP8 shard at
     construction (no BF16 source, no per-forward cast).
     """
-    from transformer_engine.common.recipe import MXFP8BlockScaling
-
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
 
     torch.manual_seed(0)
@@ -808,7 +814,7 @@ def _worker_mxfp8_linear(rank, world_size, port):
     batch, in_f, out_f = 32, 64, 128  # out_f % (16*world_size)==0 → no padding
     dtype = torch.bfloat16
     gtp_remat_group = dist.new_group(list(range(world_size)))
-    recipe = MXFP8BlockScaling(enable_2d_quantization=True)
+    recipe = get_mxfp8_block_scaling_recipe(mxfp8_2d_quantization=mxfp8_2d_quantization)
     layer = _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe)
 
     # The weight IS the native FP8 shard: a QuantizedTensor with the GTP surface attached.
@@ -824,17 +830,10 @@ def _worker_mxfp8_linear(rank, world_size, port):
     detached_w = w.detach()
     assert type(detached_w) is type(w), "detach must preserve the dynamic GTP MXFP8 type"
     assert getattr(detached_w, "is_gtp_weight_remat", False), "detach dropped GTP runtime attrs"
-    rewrapped_w = nn.Parameter(w, requires_grad=w.requires_grad)
+    assert detached_w.quantized is detached_w, "detach must preserve self.quantized"
+    rewrapped_w = nn.Parameter(detached_w, requires_grad=w.requires_grad)
     assert type(rewrapped_w) is type(w), "Parameter rewrap must preserve the GTP MXFP8 type"
-
-    # DDP's native FP8 parameter-gather path requantizes BF16 bucket slices into the dynamic GTP
-    # MXFP8 parameter after every all-gather. TE's C++ update accepts only its exact base tensor
-    # type, so MCore must present a storage-sharing base view at that boundary.
-    gathered_w = torch.zeros(w.shape, dtype=dtype, device="cuda")
-    copy_tensors_to_quantized_params([w], [gathered_w])
-    for data in (w._rowwise_data, w._columnwise_data):
-        if data is not None:
-            assert torch.count_nonzero(data) == 0, "requantization did not update shared storage"
+    assert rewrapped_w.quantized is rewrapped_w, "Parameter rewrap must preserve self.quantized"
 
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
@@ -855,6 +854,16 @@ def _worker_mxfp8_linear(rank, world_size, port):
     with fp8_autocast(enabled=True, fp8_recipe=recipe):
         out2 = layer(inp.detach(), is_first_microbatch=False)
     assert torch.isfinite(out2).all(), "MXFP8 GTP second-microbatch output has non-finite"
+
+    # DDP's native FP8 parameter-gather path requantizes BF16 bucket slices into the dynamic GTP
+    # MXFP8 parameter after every all-gather. TE's C++ update accepts only its exact base tensor
+    # type, so MCore must present a storage-sharing base view at that boundary. Keep this after the
+    # forward/backward checks so zeroing the live weight cannot make them pass trivially.
+    gathered_w = torch.zeros(w.shape, dtype=dtype, device="cuda")
+    copy_tensors_to_quantized_params([w], [gathered_w])
+    for data in (w._rowwise_data, w._columnwise_data):
+        if data is not None:
+            assert torch.count_nonzero(data) == 0, "requantization did not update shared storage"
 
 
 def _worker_mxfp8_linear_unaligned(rank, world_size, port):
@@ -893,10 +902,13 @@ def _worker_mxfp8_linear_unaligned(rank, world_size, port):
 
 
 class TestMXFP8LinearGTP:
-    def test_forward_backward(self):
+    @pytest.mark.parametrize("mxfp8_2d_quantization", [False, True], ids=["1d", "2d"])
+    def test_forward_backward(self, mxfp8_2d_quantization):
         _requires_mxfp8()
+        if mxfp8_2d_quantization:
+            _requires_mxfp8_2d()
         _requires_multi_gpu(4)
-        _run_distributed(_worker_mxfp8_linear, 4)
+        _run_distributed(_worker_mxfp8_linear, 4, mxfp8_2d_quantization)
 
     def test_forward_unaligned_padding(self):
         _requires_mxfp8()
