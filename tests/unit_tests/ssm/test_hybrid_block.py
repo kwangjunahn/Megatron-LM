@@ -11,7 +11,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -137,6 +137,101 @@ class TestHybridBlock:
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == block.config.hidden_size
         assert output.dtype == torch.float32
+
+    def test_wide_residual_gpu_forward(self):
+        """A hybrid stack carries a wide stream while every branch remains at hidden size."""
+
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        block = self.get_hybrid_block(
+            layer_pattern,
+            hidden_dropout=0.0,
+            bias_dropout_fusion=False,
+            wide_residual=WideResidualConfig(
+                num_streams=4,
+                streamwise_sigmoid_init_scale=0.0,
+                learned_retention=True,
+                retention_init=0.999,
+                retention_max_forget=0.10,
+            ),
+        ).cuda()
+        hidden_states = torch.randn(16, 2, block.config.hidden_size, device="cuda")
+        hidden_states.requires_grad_(True)
+        attention_mask = torch.ones((2, 1, 16, 16), dtype=bool, device="cuda")
+
+        output = block(hidden_states, attention_mask=attention_mask)
+
+        assert output.shape == hidden_states.shape
+        assert block.residual_stream_readout is not None
+        assert block.layers[0].residual_connection is not None
+        assert block.layers[1].residual_connection_self_attn is not None
+        assert block.layers[2].residual_connection_mlp is not None
+        assert block.layers[0].residual_stream_hidden_size == 4 * block.config.hidden_size
+
+        output.float().sum().backward()
+        controller_parameters = {
+            name: parameter
+            for name, parameter in block.named_parameters()
+            if "residual_connection" in name or "residual_stream_readout" in name
+        }
+        assert controller_parameters
+        assert all(parameter.grad is not None for parameter in controller_parameters.values())
+
+    @pytest.mark.timeout(60)
+    def test_wide_residual_full_recompute_matches_eager(self):
+        """Full layer recomputation preserves hybrid wide-residual outputs and gradients."""
+
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        wide_residual = WideResidualConfig(
+            num_streams=4,
+            streamwise_sigmoid_init_scale=0.01,
+            learned_retention=True,
+            retention_init=0.999,
+            retention_max_forget=0.10,
+        )
+
+        def run(block, hidden_states, attention_mask):
+            output = block(hidden_states, attention_mask=attention_mask)
+            output.float().sum().backward()
+            gradients = {
+                name: parameter.grad.detach().float().cpu()
+                for name, parameter in block.named_parameters()
+                if parameter.grad is not None
+            }
+            return output.detach().float().cpu(), gradients
+
+        seed = 1234
+        torch.manual_seed(seed)
+        hidden_states = torch.randn(16, 2, 256, device="cuda", requires_grad=True)
+        attention_mask = torch.ones((2, 1, 16, 16), dtype=bool, device="cuda")
+
+        model_parallel_cuda_manual_seed(seed)
+        torch.manual_seed(seed)
+        eager = self.get_hybrid_block(
+            layer_pattern,
+            hidden_dropout=0.0,
+            bias_dropout_fusion=False,
+            wide_residual=wide_residual,
+        ).cuda()
+        eager_output, eager_gradients = run(eager, hidden_states, attention_mask)
+
+        model_parallel_cuda_manual_seed(seed)
+        torch.manual_seed(seed)
+        recomputed = self.get_hybrid_block(
+            layer_pattern,
+            hidden_dropout=0.0,
+            bias_dropout_fusion=False,
+            wide_residual=wide_residual,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        ).cuda()
+        recompute_input = hidden_states.detach().clone().requires_grad_(True)
+        recomputed_output, recomputed_gradients = run(recomputed, recompute_input, attention_mask)
+
+        assert torch.equal(recomputed_output, eager_output)
+        assert recomputed_gradients.keys() == eager_gradients.keys()
+        for name, eager_gradient in eager_gradients.items():
+            assert torch.equal(recomputed_gradients[name], eager_gradient), name
 
     def _run_forward(self, block, sequence_length=32, micro_batch_size=2):
         block.cuda()

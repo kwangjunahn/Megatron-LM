@@ -20,6 +20,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.residual_connection import (
+    ResidualConnectionSpec,
+    build_residual_connection,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -41,6 +45,7 @@ class MambaLayerSubmodules:
         mixer (Union[ModuleSpec, type]): Specification for the along-sequence mixing mechanism.
         mamba_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after the mixer.
+        residual_connection: Optional residual-stream read/write around the Mamba mixer.
     """
 
     norm: LayerNormBuilder = IdentityOp
@@ -49,6 +54,9 @@ class MambaLayerSubmodules:
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+
+    # Keep this optional architecture seam after existing fields for positional compatibility.
+    residual_connection: ResidualConnectionSpec = None
 
 
 class MambaLayer(GraphableMegatronModule):
@@ -96,7 +104,34 @@ class MambaLayer(GraphableMegatronModule):
             eps=self.config.layernorm_epsilon,
         )
         self.mamba_bda = build_module(submodules.mamba_bda)
+        self.residual_connection = build_residual_connection(
+            submodules.residual_connection,
+            config=self.config,
+            layer_number=self.layer_number,
+            branch_name="mamba_mixer",
+            pg_collection=pg_collection,
+            name=(name + ".residual_connection") if name is not None else None,
+        )
+        self.residual_stream_hidden_size = (
+            self.residual_connection.residual_stream_hidden_size
+            if self.residual_connection is not None
+            else self.config.hidden_size
+        )
         self.bias_dropout_add_exec_handler = torch.enable_grad
+
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        """Get CUDA-graph inputs using the configured residual-stream width."""
+
+        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        hidden_states = static_inputs["hidden_states"]
+        if hidden_states.shape[-1] != self.residual_stream_hidden_size:
+            static_inputs["hidden_states"] = torch.ones(
+                (*hidden_states.shape[:-1], self.residual_stream_hidden_size),
+                dtype=hidden_states.dtype,
+                requires_grad=hidden_states.requires_grad,
+                device=hidden_states.device,
+            )
+        return static_inputs
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the mamba layer for cudagraphs."""
@@ -144,9 +179,17 @@ class MambaLayer(GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        residual = hidden_states
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
+        connection_state = None
+        if self.residual_connection is not None:
+            hidden_states, connection_state = apply_module(self.residual_connection)(
+                hidden_states,
+                operation="read",
+                fp32_residual_connection=self.config.fp32_residual_connection,
+            )
+        else:
+            residual = hidden_states
+            if self.config.fp32_residual_connection:
+                residual = residual.float()
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
@@ -155,10 +198,20 @@ class MambaLayer(GraphableMegatronModule):
             hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
         )
 
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mamba_bda(
-                training=self.training, fused=self.config.bias_dropout_fusion
-            )(mixer_out_with_bias, residual, self.hidden_dropout)
+        if self.residual_connection is not None:
+            assert connection_state is not None
+            hidden_states = apply_module(self.residual_connection)(
+                mixer_out_with_bias,
+                operation="write",
+                state=connection_state,
+                dropout_probability=self.hidden_dropout,
+                training=self.training,
+            )
+        else:
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.mamba_bda(
+                    training=self.training, fused=self.config.bias_dropout_fusion
+                )(mixer_out_with_bias, residual, self.hidden_dropout)
 
         return hidden_states
 

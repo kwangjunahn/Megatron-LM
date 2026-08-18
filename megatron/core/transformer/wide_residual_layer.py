@@ -301,7 +301,7 @@ def specialize_wide_residual_layer_spec(
 ) -> ModuleSpec:
     """Return a copied layer spec with explicit wide-residual branch connections.
 
-    - Self-attention and dense MLP branches receive a D'->D->D' connection.
+    - Self-attention, Mamba, and dense MLP branches receive a D'->D->D' connection.
     - MoE branches receive the same outer connection, so the existing router,
       routed experts, and optional shared experts all continue to operate at D.
     """
@@ -318,16 +318,23 @@ def specialize_wide_residual_layer_spec(
     layer_module = _resolve_module(specialized)
     connection_spec = ModuleSpec(module=StreamwiseSigmoidWideResidualConnection)
 
+    from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
     from megatron.core.transformer.transformer_layer import (
         MoETransformerLayer,
         TransformerLayer,
         TransformerLayerSubmodules,
     )
 
+    if isinstance(layer_module, type) and issubclass(layer_module, MambaLayer):
+        if not isinstance(specialized.submodules, MambaLayerSubmodules):
+            raise TypeError("Wide-residual Mamba specs require MambaLayerSubmodules.")
+        specialized.submodules.residual_connection = connection_spec
+        return specialized
+
     if not (isinstance(layer_module, type) and issubclass(layer_module, TransformerLayer)):
         raise TypeError(
-            "wide_residual submodule connections currently support TransformerLayer specs, "
-            f"got {layer_module!r}."
+            "wide_residual submodule connections currently support TransformerLayer and "
+            f"MambaLayer specs, got {layer_module!r}."
         )
     if not isinstance(specialized.submodules, TransformerLayerSubmodules):
         raise TypeError("Wide-residual Transformer specs require TransformerLayerSubmodules.")
