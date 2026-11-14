@@ -118,13 +118,15 @@ class AdditiveHiddenStateFusion(HiddenStateFusion):
         submodules: AdditiveHiddenStateFusionSubmodules,
         pg_collection,
         bias: bool = False,
+        zero_init: bool = True,
     ) -> None:
         super().__init__(config, pg_collection)
         self.hidden_state_norm = submodules.hidden_state_norm(
             config=config, hidden_size=config.hidden_size, eps=config.layernorm_epsilon
         )
+        init_method = nn.init.zeros_ if zero_init else config.init_method
         self.hidden_state_projection = self._build_projection(
-            submodules.hidden_state_projection, nn.init.zeros_, bias=bias
+            submodules.hidden_state_projection, init_method, bias=bias
         )
         self.tag_parameters()
 
